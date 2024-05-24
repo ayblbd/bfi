@@ -1,1012 +1,682 @@
-from pyspark.sql import Column, DataFrame, Window
-from pyspark.sql.functions import (
-    abs,
-    approx_count_distinct,
-    array_join,
-    coalesce,
-    col,
-    collect_list,
-    collect_set,
-    from_unixtime,
-    exp,
-    expr,
-    lag,
-    last,
-    lit,
-    regexp_extract,
-    split,
-    substring,
-    sum,
-    trim,
-    unix_timestamp,
-    when,
-)
-
-from src.utils import (
-    extract_field_from_message,
-    extract_field_with_brackets_from_message,
-    ffill,
-    is_ip,
-    to_unix,
-)
-
-MONEY_OPERATIONS = ["2", "5", "B"]
-MAX_DISPOSITION = 2_000
-MAX_VIREMENT = 50_000
-MAX_CASHEXPRESS = 80_000
-SIGNIFICANT_DISPOSITION = 1_500
-SIGNIFICANT_VIREMENT = 20_000
-LOW_VIREMENT_THRESHOLD = 500
+from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql.functions import col, current_date, expr, lit, substring, when
 
 
-def transform(
-    audit_ebk: DataFrame, mobile_device: DataFrame, device_history: DataFrame
+def build_compte_tenu(
+    spark: SparkSession,
+    compte_commercial: DataFrame,
+    ret_documents: DataFrame,
+    client: DataFrame,
+    titulaire: DataFrame,
+    sous_compte: DataFrame,
+    elt_contrat: DataFrame,
+    contrat: DataFrame,
+    fdc_compte: DataFrame,
+    t705: DataFrame,
+    cpte_tenu_par_client: DataFrame,
 ) -> DataFrame:
-    df = to_unix(audit_ebk, "audit_fact_date")
-
-    df = amount_virement(df)
-    df = amount_disposition(df)
-    df = amount_cashexpress(df)
-    df = amount_scaled(df)
-    df = device_pattern_features(df, mobile_device, device_history, unix_timestamp())
-    facture = df.filter(col("event_type") == lit("A"))
-    df = reset_pattern_features(df)
-    df = fill_all(df)
-    extra_cols = [column for column in df.columns if column not in facture.columns]
-    for column in extra_cols:
-        facture = facture.withColumn(column, lit(None))
-    return df.unionByName(facture).withColumn(
-        "audit_fact_date", from_unixtime("audit_fact_date")
+    compte_commercial.createOrReplaceTempView("COMPTECOMMERCIAL")
+    ret_documents.createOrReplaceTempView("RETDOCUMENTS")
+    client.createOrReplaceTempView("CLIENT")
+    titulaire.createOrReplaceTempView("TITULAIRE")
+    sous_compte.createOrReplaceTempView("SOUSCOMPTE")
+    elt_contrat.createOrReplaceTempView("ELT_CONTRAT")
+    contrat.createOrReplaceTempView("CONTRAT")
+    fdc_compte.createOrReplaceTempView("FDCCOMPTE")
+    t705.createOrReplaceTempView("T705")
+    cpte_tenu_par_client.createOrReplaceTempView("CPTETENUPARCLIENT")
+    return spark.sql(
+        """
+SELECT DISTINCT NUMEROTIERS,
+        NUMERODECOMPTE,
+        NUMEROCOMPTEORIGINE,
+        DEVISE,
+        NATURECOMPTE,
+        INTITULE,
+        REPRESENTANTETRANGER,
+        ETAT_COMPTE,
+        DATEEFFET,
+        DATEECHEANCE,
+        AgenceGEST,
+        CDFDC_GEST,
+        GESTIONNAIRE_GEST,
+        NOMGEST_GEST,
+        QUALITEPTF,
+        AgenceOP,
+        CDFDC_OP,
+        GESTIONNAIRE_OP,
+        NOMGEST_OP
+FROM
+(SELECT core2.*,
+    b.RATTACHE AS AgenceOP,
+    b.CDGEST AS CDFDC_OP,
+    b.GESTIONNAIRE AS GESTIONNAIRE_OP,
+    b.NOMGEST AS NOMGEST_OP
+FROM
+(SELECT core.*,
+        b.RATTACHE AS AgenceGEST,
+        b.CDGEST AS CDFDC_GEST,
+        b.GESTIONNAIRE AS GESTIONNAIRE_GEST,
+        b.NOMGEST AS NOMGEST_GEST,
+        b.QUALITEPTF
+FROM
+(SELECT EXPLOIT_CLIENT.NUMEROTIERS,
+        q.NUMERODECOMPTE,
+        q.NUMEROCOMPTEORIGINE,
+        EXPLOIT_CLIENT.DEVISE,
+        q.NATURECOMPTE,
+        q.INTITULE,
+        q.REPRESENTANTETRANGER,
+        CASE EXPLOIT_SOUSCOMPTE.ETATCOMPTE
+            WHEN '0' THEN 'OUVERT'
+            WHEN '1' THEN 'OUVERT'
+            WHEN '3' THEN 'CLOTURE'
+            WHEN '5' THEN 'ACLORE'
+            ELSE 'DEMCLOT'
+        END AS ETAT_COMPTE,
+        EXPLOIT_ELT_CONTRAT.DATEEFFET,
+        EXPLOIT_ELT_CONTRAT.DATEECHEANCE,
+        q.NATURECOMPTE
+    FROM
+    (SELECT CPTTENUPARCLIENT.NUMERODECOMPTE,
+            CPTTENUPARCLIENT.NUMEROCOMPTEORIGINE,
+            EXPLOIT_COMPTECOMMERCIAL.NATURECOMPTE,
+            EXPLOIT_COMPTECOMMERCIAL.INTITULE,
+            EXPLOIT_COMPTECOMMERCIAL.REPRESENTANTETRANGER
+    FROM CPTETENUPARCLIENT AS CPTTENUPARCLIENT
+    LEFT JOIN COMPTECOMMERCIAL AS EXPLOIT_COMPTECOMMERCIAL
+ON CPTTENUPARCLIENT.NUMEROCOMPTEORIGINE = EXPLOIT_COMPTECOMMERCIAL.NUMERODECOMPTE) q
+    LEFT JOIN SOUSCOMPTE AS EXPLOIT_SOUSCOMPTE
+    ON EXPLOIT_SOUSCOMPTE.numerodecompte = q.NUMEROCOMPTEORIGINE,
+                                                CLIENT AS EXPLOIT_CLIENT,
+                                                TITULAIRE AS EXPLOIT_TITULAIRE,
+                                                ELT_CONTRAT AS EXPLOIT_ELT_CONTRAT,
+                                                CONTRAT AS EXPLOIT_CONTRAT
+    WHERE EXPLOIT_CLIENT.numerotiers = EXPLOIT_TITULAIRE.numerotiers
+AND EXPLOIT_SOUSCOMPTE.numeroelementinterne = EXPLOIT_ELT_CONTRAT.numeroelementinterne
+AND EXPLOIT_ELT_CONTRAT.NUMEROCONTRATINTERNE = EXPLOIT_TITULAIRE.NUMEROCONTRATINTERNE
+AND EXPLOIT_TITULAIRE.TITULAIREPRINCIPAL = 1
+AND EXPLOIT_ELT_CONTRAT.TYPEDEPRODUIT = 'CA03'
+AND EXPLOIT_ELT_CONTRAT.NUMEROCONTRATINTERNE = EXPLOIT_CONTRAT.NUMEROCONTRATINTERNE) core,
+    FDCCOMPTE a,
+    T705 b
+WHERE b.RATTACHE = a.LIEUFDCCOMPTE
+AND b.CODEFONDSDECOMMERCE = a.CODEFONDSDECOMMERCE
+AND b.DFVAL > CURRENT_DATE
+AND a.TYPEFDCCOMPTE=1
+AND core.NUMEROCOMPTEORIGINE=a.NUMERODECOMPTE) core2,
+FDCCOMPTE a,
+T705 b
+WHERE b.RATTACHE = a.LIEUFDCCOMPTE
+AND b.CODEFONDSDECOMMERCE = a.CODEFONDSDECOMMERCE
+AND b.DFVAL > CURRENT_DATE
+AND a.TYPEFDCCOMPTE=2
+AND core2.NUMEROCOMPTEORIGINE=a.NUMERODECOMPTE);
+"""
     )
 
 
-def fill_all(df: DataFrame) -> DataFrame:
-    df = df.fillna(
-        0,
-        [
-            "device_change",
-            "device_count",
-            "cumsum_disposition_12_hours",
-            "cumsum_virement_12_hours",
-            "average_amount_scaled_12h",
-        ],
-    ).fillna(-1, ["time_diff_to_attijari_secure", "device_age"])
-
-    return device_age_normalized(time_diff_to_attijari_secure_normalized(df))
-
-
-def reset_pattern_features(df: DataFrame) -> DataFrame:
-    df = df.filter((col("event_type") != lit("8")) & (col("event_type") != lit("A")))
-    df = rank(df, "rank", "9")
-
-    df = is_reset_pattern_disposition(df)
-    df = is_reset_pattern_virement(df)
-    df = is_reset(df).drop("rank")
-
-    df = time_diff(df)
-    df = time_diff_inv(df)
-    df = time_diff_to_reset(df)
-    df = time_diff_to_reset_normalized(df)
-    df = time_diff_to_reset_normalized_sigmoid(df)
-    df = criterion(df)
-    return df
-
-
-def ip_features(df: DataFrame) -> DataFrame:
-    df = accounts_count(df)
-    df = time_diff_to_last_money_operation_by_ip(df)
-    return df
-
-
-def device_pattern_features(
-    audit_ebk: DataFrame,
-    mobile_device: DataFrame,
-    device_history: DataFrame,
-    relative_to: Column,
+def build_dim_agence(
+    spark: SparkSession,
+    exp_t608_2: DataFrame,
+    niveau_1: DataFrame,
+    niveau_0: DataFrame,
+    niveau_3: DataFrame,
 ) -> DataFrame:
-    mobile_device = to_unix(mobile_device, "creation_date")
-    device_history = to_unix(device_history, "connection_date")
+    exp_t608_2.createOrReplaceTempView("EXP_T608_2")
+    niveau_1.createOrReplaceTempView("ENTITE_NIVEAU_1")
+    niveau_0.createOrReplaceTempView("ENTITE_NIVEAU_0")
+    niveau_3.createOrReplaceTempView("ENTITE_NIVEAU_3")
 
-    df = join_tables(
-        audit_ebk.filter(
-            col("audit_fact_date") >= unix_timestamp(lit("2022-02-18"), "yyyy-MM-dd")
-        ),
-        mobile_device,
-        device_history,
+    return spark.sql(
+        """
+WITH niv_1 AS
+  (SELECT ENTITE AS CODEENTITE,
+          NOMENTIT AS NOMENTITE,
+          DIRZONE AS CODEBANQUE,
+          GRREG AS CODEREGION,
+          LOCALI,
+          CVILLE,
+          SECTGEO,
+          OPERATIONNELLE
+   FROM EXP_T608_2
+   WHERE (ENTITE IS NOT NULL
+          AND GRREG IS NOT NULL
+          AND DFVAL>CURRENT_DATE()
+          AND SUCCURSALE IS NULL
+          AND ENTITE=GRREG)
+   UNION ALL SELECT CODEENTITE,
+                    NOMENTITE,
+                    CODEBANQUE,
+                    CODEREGION,
+                    LOCALI,
+                    CVILLE,
+                    SECTGEO,
+                    OPERATIONNELLE
+   FROM ENTITE_NIVEAU_1)
+SELECT tmp2.*,
+       d.NOMBANQUE
+FROM
+  (SELECT tmp1.*,
+          c.NOMENTIT AS NOMREGION
+   FROM
+     (SELECT (CASE
+                  WHEN CODEAGENCE IS NULL THEN CODESUCC
+                  ELSE CODEAGENCE
+              END) AS CODEAGENCE,
+             (CASE
+                  WHEN NOMAGENCE IS NULL THEN NOMSUCC
+                  ELSE NOMAGENCE
+              END) AS NOMAGENCE,
+             (CASE
+                  WHEN CODEAGENCE IS NULL THEN NULL
+                  ELSE CODESUCC
+              END) AS CODESUCC,
+             (CASE
+                  WHEN NOMAGENCE IS NULL THEN NULL
+                  ELSE NOMSUCC
+              END) AS NOMSUCC,
+             (CASE
+                  WHEN CODEREGION0 IS NULL THEN CODEREGION1
+                  ELSE CODEREGION0
+              END) AS CODEREGION,
+             (CASE
+                  WHEN CODEBANQUE0 IS NULL THEN CODEBANQUE1
+                  ELSE CODEBANQUE0
+              END) AS CODEBANQUE
+      FROM
+        (SELECT a.CODEAGENCE,
+                a.NOMAGENCE,
+                a.CODEREGION AS CODEREGION0,
+                b.CODEREGION AS CODEREGION1,
+                b.CODEENTITE AS CODESUCC,
+                b.NOMENTITE AS NOMSUCC,
+                a.CODEBANQUE AS CODEBANQUE0,
+                b.CODEBANQUE AS CODEBANQUE1
+         FROM ENTITE_NIVEAU_0 a
+         RIGHT JOIN niv_1 b ON a.CODESUCCURSALE=b.CODEENTITE)) tmp1
+   LEFT JOIN
+     (SELECT ENTITE,
+             NOMENTIT,
+             DIRZONE AS CODEBANQUE,
+             LOCALI,
+             CVILLE,
+             SECTGEO,
+             OPERATIONNELLE
+      FROM EXP_T608_2
+      WHERE (GRREG IS NULL
+             OR GRREG=ENTITE
+             OR GRREG not in
+               (SELECT CODEREGION
+                FROM ENTITE_NIVEAU_0)
+             OR GRREG not in
+               (SELECT CODEREGION
+                FROM niv_1))
+        AND (DFVAL > CURRENT_DATE())
+        AND (DIRZONE IS NOT NULL
+             OR ENTITE in
+               (SELECT CODEBANQUE
+                FROM ENTITE_NIVEAU_3)) ) c ON tmp1.CODEREGION=c.ENTITE) tmp2
+LEFT JOIN ENTITE_NIVEAU_3 d ON tmp2.CODEBANQUE=d.CODEBANQUE"""
     )
-    # audit_ebk_with_device_id = audit_ebk.filter(col("device_id").isNotNull()).withColumnRenamed("device_id", "mobile_device_id")
-
-    df = ffill(df, "uuid")
-    df = ffill(df, "creation_date")
-    # df = ffill(df, "device_id")
-    df = ffill(df, "name")
-    df = ffill(df, "os")
-    # since join on login only, we should forward fill on mobile_device_id to have device infos for other events
-    df = ffill(df, "mobile_device_id")
-
-    df = device_change(df)
-    df = device_count(df)
-    df = is_attijari_secure_deactivated_pattern(df)
-    df = is_attijari_secure_activated_pattern(df)
-    df = time_diff_to_attijari_secure(df)
-    df = time_diff_to_attijari_secure_normalized(df)
-
-    df = device_age(df, relative_to)
-    df = device_age_normalized(df)
-
-    df = cumsum_disposition_12_hours(df)
-    df = cumsum_virement_12_hours(df)
-    df = cumsum_cashexpress_12_hours(df)
-
-    df = average_amount_scaled_12h(df)
-    df = is_safe_facture_device(df)
-    df = is_awb_secure_deactivated_safe_device(df)
-    df = is_awb_secure_activated_safe_device(df)
-
-    return df
 
 
-def is_awb_secure_deactivated_safe_device(df: DataFrame) -> DataFrame:
-    return df.withColumn(
-        "is_awb_secure_deactivated_safe_device",
-        when(
-            col("is_safe_facture_device") == lit(0),
-            col("is_attijari_secure_deactivated_pattern"),
-        ).otherwise(0),
-    )
-
-
-def is_awb_secure_activated_safe_device(df: DataFrame) -> DataFrame:
-    return df.withColumn(
-        "is_awb_secure_activated_safe_device",
-        when(
-            col("is_safe_facture_device") == lit(0),
-            col("is_attijari_secure_activated_pattern"),
-        ).otherwise(0),
-    )
-
-
-def join_tables(
-    audit_ebk: DataFrame, mobile_device: DataFrame, device_history: DataFrame
+def build_dim_compte(
+    compte_commercial: DataFrame,
+    client: DataFrame,
+    titulaire: DataFrame,
+    sous_compte: DataFrame,
+    elt_contrat: DataFrame,
+    contrat: DataFrame,
+    fdc_compte: DataFrame,
+    t705: DataFrame,
 ) -> DataFrame:
-    history_with_uuid = (
-        device_history.select("mobile_device_id", "connection_date")
+    base_query = (
+        compte_commercial.alias("q")
         .join(
-            mobile_device.withColumnRenamed("id", "mobile_device_id"),
-            ["mobile_device_id"],
+            client.alias("EXPLOIT_CLIENT"),
+            col("EXPLOIT_CLIENT.NUMEROTIERS") == col("EXPLOIT_CLIENT.NUMEROTIERS"),
+        )
+        .join(
+            titulaire.alias("EXPLOIT_TITULAIRE"),
+            col("EXPLOIT_CLIENT.NUMEROTIERS") == col("EXPLOIT_TITULAIRE.NUMEROTIERS"),
+        )
+        .join(
+            sous_compte.alias("EXPLOIT_SOUSCOMPTE"),
+            (col("q.NUMERODECOMPTE") == col("EXPLOIT_SOUSCOMPTE.NUMERODECOMPTE")),
+        )
+        .join(
+            elt_contrat.alias("EXPLOIT_ELT_CONTRAT"),
+            (
+                (
+                    col("EXPLOIT_TITULAIRE.NUMEROCONTRATINTERNE")
+                    == col("EXPLOIT_ELT_CONTRAT.NUMEROCONTRATINTERNE")
+                )
+                & (
+                    col("EXPLOIT_SOUSCOMPTE.NUMEROELEMENTINTERNE")
+                    == col("EXPLOIT_ELT_CONTRAT.NUMEROELEMENTINTERNE")
+                )
+            ),
+        )
+        .join(
+            contrat.alias("EXPLOIT_CONTRAT"),
+            col("EXPLOIT_ELT_CONTRAT.NUMEROCONTRATINTERNE")
+            == col("EXPLOIT_CONTRAT.NUMEROCONTRATINTERNE"),
+        )
+        .where(
+            (col("EXPLOIT_TITULAIRE.TITULAIREPRINCIPAL") == 1)
+            & (col("EXPLOIT_ELT_CONTRAT.TYPEDEPRODUIT") == "CA03")
         )
         .select(
-            "id_user",
-            "mobile_device_id",
-            "name",
-            "os",
-            "uuid",
-            "creation_date",
-            "connection_date",
+            col("EXPLOIT_CLIENT.NUMEROTIERS").alias("NUMEROTIERS"),
+            col("q.NUMERODECOMPTE").alias("NUMERODECOMPTE"),
+            col("EXPLOIT_CLIENT.DEVISE").alias("DEVISE"),
+            col("q.INTITULE").alias("INTITULE"),
+            when(col("EXPLOIT_SOUSCOMPTE.ETATCOMPTE") == lit("0"), "OUVERT")
+            .when(col("EXPLOIT_SOUSCOMPTE.ETATCOMPTE") == lit("1"), "OUVERT")
+            .when(col("EXPLOIT_SOUSCOMPTE.ETATCOMPTE") == lit("3"), "CLOTURE")
+            .when(col("EXPLOIT_SOUSCOMPTE.ETATCOMPTE") == lit("5"), "ACLORE")
+            .otherwise("DEMCLOT")
+            .alias("ETAT_COMPTE"),
+            col("EXPLOIT_ELT_CONTRAT.DATEEFFET").alias("DATEEFFET"),
+            col("EXPLOIT_ELT_CONTRAT.DATEECHEANCE").alias("DATEECHEANCE"),
+            col("q.NATURECOMPTE").alias("NATURECOMPTE"),
         )
     )
-    return audit_ebk.join(
-        history_with_uuid,
-        (col("user_id") == col("id_user"))
-        & (col("event_type") == lit("8"))
-        & (abs(col("audit_fact_date") - col("connection_date")) < 5),
-        "left_outer",
-    ).drop("id_user", "connection_date")
 
-
-def rank(df: DataFrame, rank_name: str, event_trigger: str) -> DataFrame:
-    return df.withColumn(
-        rank_name,
-        sum(
-            when(
-                col("event_type") == lit(event_trigger),
-                1,
-            ).otherwise(0)
-        ).over(Window.partitionBy("user_id").orderBy("audit_fact_date")),
+    # Adding FDCTIERS
+    core_with_fdctiers = base_query.join(
+        fdc_compte.alias("a"),
+        (
+            (base_query["NUMERODECOMPTE"] == col("a.NUMERODECOMPTE"))
+            & (col("a.TYPEFDCCOMPTE") == 1)
+        ),
+    ).select(
+        base_query["NUMEROTIERS"],
+        base_query["NUMERODECOMPTE"],
+        base_query["DEVISE"],
+        base_query["INTITULE"],
+        base_query["ETAT_COMPTE"],
+        base_query["DATEEFFET"],
+        base_query["DATEECHEANCE"],
+        base_query["NATURECOMPTE"],
+        col("a.LIEUFDCCOMPTE").alias("LIEUFDCCOMPTE"),
+        col("a.CODEFONDSDECOMMERCE").alias("CODEFONDSDECOMMERCE"),
     )
 
+    # First LEFT JOIN with T705
+    core2 = core_with_fdctiers.join(
+        t705.alias("b"),
+        (col("b.RATTACHE") == core_with_fdctiers["LIEUFDCCOMPTE"])
+        & (col("b.CODEFONDSDECOMMERCE") == core_with_fdctiers["CODEFONDSDECOMMERCE"])
+        & (col("b.DFVAL") > current_date()),
+    ).select(
+        "NUMEROTIERS",
+        "NUMERODECOMPTE",
+        "NATURECOMPTE",
+        "INTITULE",
+        "ETAT_COMPTE",
+        "DEVISE",
+        col("b.RATTACHE").alias("AGENCEGEST"),
+        col("b.CDGEST").alias("CD_FDC_GEST"),
+        col("b.GESTIONNAIRE").alias("GESTIONNAIRE_GEST"),
+    )
 
-def is_reset_pattern_disposition(df: DataFrame) -> DataFrame:
-    conditions = regexp_extract(
-        "pattern",
-        r"^9,.*3,",
-        0,
-    ) != lit("")
-
-    df = (
-        df.withColumn(
-            "pattern",
-            when(
-                col("event_type").isin("5"),
-                collect_list(col("event_type")).over(
-                    Window.partitionBy("user_id", "rank")
-                    .orderBy("audit_fact_date")
-                    .rowsBetween(Window.unboundedPreceding, Window.currentRow)
-                ),
-            ),
+    # Second FDCTIERS join and renaming for clarity
+    core3 = (
+        core2.alias("core2")
+        .join(
+            fdc_compte.alias("a"),
+            (col("core2.NUMERODECOMPTE") == col("a.NUMERODECOMPTE"))
+            & (col("a.TYPEFDCCOMPTE") == 2),
         )
-        .withColumn("pattern", array_join(col("pattern"), ","))
-        .withColumn("is_reset_pattern_disposition", when(conditions, 1).otherwise(0))
-        .drop("pattern")
+        .select(
+            col("a.NUMERODECOMPTE").alias("NUMERODECOMPTE"),
+            "NUMEROTIERS",
+            "NATURECOMPTE",
+            "INTITULE",
+            "ETAT_COMPTE",
+            "DEVISE",
+            "AGENCEGEST",
+            "CD_FDC_GEST",
+            "GESTIONNAIRE_GEST",
+            col("a.LIEUFDCCOMPTE").alias("LIEUFDCCOMPTE"),
+            col("a.CODEFONDSDECOMMERCE").alias("CODEFONDSDECOMMERCE"),
+        )
     )
 
-    return df
+    # Second LEFT JOIN with T705 for core4 and final selection
+    core4 = core3.join(
+        t705.alias("b"),
+        (core3["LIEUFDCCOMPTE"] == col("b.RATTACHE"))
+        & (core3["CODEFONDSDECOMMERCE"] == col("b.CODEFONDSDECOMMERCE"))
+        & (col("b.DFVAL") > current_date()),
+    ).select(
+        core3["NUMEROTIERS"],
+        core3["NUMERODECOMPTE"],
+        core3["NATURECOMPTE"],
+        core3["INTITULE"],
+        core3["ETAT_COMPTE"],
+        core3["DEVISE"],
+        core3["AGENCEGEST"],
+        core3["CD_FDC_GEST"],
+        core3["GESTIONNAIRE_GEST"],
+        col("b.RATTACHE").alias("AGENCEOP"),
+        col("b.CDGEST").alias("CD_FDC_OP"),
+        col("b.GESTIONNAIRE").alias("GESTIONNAIRE_OP"),
+    )
+
+    # Since the SQL query specifies DISTINCT, let's apply a distinct operation
+    # to the final DataFrame.
+
+    distinct_core4 = core4.distinct()
+    return distinct_core4
 
 
-def amount_scaled(df: DataFrame) -> DataFrame:
+def build_dim_level0(exp_t608_2: DataFrame) -> DataFrame:
+    return exp_t608_2.selectExpr(
+        "ENTITE as CODEAGENCE",
+        "NOMENTIT as NOMAGENCE",
+        "GRREG as CODEREGION",
+        "DIRZONE as CODEBANQUE",
+        "SUCCURSALE AS CODESUCCURSALE",
+        "TELAGE AS TELEPHONE",
+        "LOCALI",
+        "CVILLE",
+        "SECTGEO",
+        "OPERATIONNELLE",
+    ).filter(
+        (col("Entite").isNotNull())
+        & (col("GRREG").isNotNull())
+        & (col("DFVAL") > current_date())
+        & (col("SUCCURSALE").isNotNull())
+    )
+
+
+def build_dim_level1(exp_t608_2: DataFrame) -> DataFrame:
+    # Define the conditions
+    conditions = (
+        col("SUCCURSALE").isNull()
+        & col("ENTITE").isNotNull()
+        & col("GRREG").isNotNull()
+        & (col("ENTITE") < 800)
+        & (col("DFVAL") > current_date())
+        & (col("ENTITE") != col("GRREG"))
+    )
+
+    # Subquery to get distinct GRREG values
+    subquery = (
+        exp_t608_2.filter(col("GRREG").isNotNull()).select("GRREG").distinct().collect()
+    )
+    grreg_list = [row["GRREG"] for row in subquery]
+
+    # Apply the conditions and perform the subquery filter
     return (
-        df.withColumn(
-            "amount_virement_scaled",
-            col("amount_virement") / MAX_VIREMENT,
-        )
-        .withColumn(
-            "amount_disposition_scaled",
-            col("amount_disposition") / MAX_DISPOSITION,
-        )
-        .withColumn(
-            "amount_cashexpress_scaled",
-            col("amount_cashexpress") / MAX_CASHEXPRESS,
-        )
-        .withColumn(
-            "amount_scaled",
-            col("amount_virement_scaled")
-            + col("amount_disposition_scaled")
-            + col("amount_cashexpress_scaled"),
-        )
-        .drop(
-            "amount_virement_scaled",
-            "amount_disposition_scaled",
-            "amount_cashexpress_scaled",
+        exp_t608_2.filter(conditions)
+        .filter(~col("ENTITE").isin(grreg_list))
+        .select(
+            col("ENTITE").alias("CODEENTITE"),
+            col("NOMENTIT").alias("NOMENTITE"),
+            col("GRREG").alias("CODEREGION"),
+            col("DIRZONE").alias("CODEBANQUE"),
+            col("TELAGE").alias("TELEPHONE"),
+            col("LOCALI"),
+            col("CVILLE"),
+            col("SECTGEO"),
+            col("OPERATIONNELLE"),
         )
     )
 
 
-def is_reset(df: DataFrame) -> DataFrame:
-    return df.withColumn(
-        "is_reset",
-        col("is_reset_pattern_virement") + col("is_reset_pattern_disposition"),
+def build_dim_level3(exp_t608_2: DataFrame) -> DataFrame:
+    conditions = (
+        col("GRREG").isNull()
+        & (col("DFVAL") > current_date())
+        & col("DIRZONE").isNull()
+    )
+
+    # Apply the conditions, select the required columns, and order by ENTITE
+    return exp_t608_2.filter(conditions).select(
+        col("ENTITE").alias("CODEBANQUE"),
+        col("NOMENTIT").alias("NOMBANQUE"),
+        col("LOCALI"),
+        col("CVILLE"),
+        col("SECTGEO"),
+        col("OPERATIONNELLE"),
     )
 
 
-def is_reset_pattern_virement(df: DataFrame) -> DataFrame:
-    conditions = regexp_extract(
-        "pattern",
-        r"^9,.*3,.*1,",
-        0,
-    ) != lit("")
-
-    df = (
-        df.withColumn(
-            "pattern",
-            when(
-                col("event_type").isin("2"),
-                collect_list(col("event_type")).over(
-                    Window.partitionBy("user_id", "rank")
-                    .orderBy("audit_fact_date")
-                    .rowsBetween(Window.unboundedPreceding, Window.currentRow)
-                ),
-            ),
-        )
-        .withColumn("pattern", array_join(col("pattern"), ","))
-        .withColumn("is_reset_pattern_virement", when(conditions, 1).otherwise(0))
-        .drop("pattern")
+def build_dim_type_ress_emp(capjour_param2_oe: DataFrame) -> DataFrame:
+    # First part of the UNION - Working with LIGNE_CREDIT
+    part1 = capjour_param2_oe.filter(col("LIGNE_CREDIT").isNotNull()).select(
+        col("PCI"),
+        col("NATURE"),
+        col("LIGNE_CREDIT").alias("CODE_LIGNE"),
+        lit("RESS").alias("CATEGORIE"),
+        when(substring(col("LIGNE_CREDIT"), 1, 2) == "50", "R.BAM/TRES/CCP")
+        .when(substring(col("LIGNE_CREDIT"), 1, 2) == "51", "DET/EC")
+        .when(substring(col("LIGNE_CREDIT"), 1, 2) == "52", "DET/SF")
+        .when(substring(col("LIGNE_CREDIT"), 1, 2) == "61", "RAV")
+        .when(substring(col("LIGNE_CREDIT"), 1, 3).isin(["624", "627"]), "REP")
+        .when(substring(col("LIGNE_CREDIT"), 1, 3).isin(["625", "626"]), "RAT")
+        .when(substring(col("LIGNE_CREDIT"), 1, 2) == "65", "DEP.DIV")
+        .when(substring(col("LIGNE_CREDIT"), 1, 2).isin(["67", "68"]), "DEP.DIV")
+        .when(substring(col("LIGNE_CREDIT"), 1, 2) == "73", "CD")
+        .when(substring(col("LIGNE_CREDIT"), 1, 2) == "10", "E.BAM/TRES/CCP")
+        .when(substring(col("LIGNE_CREDIT"), 1, 2) == "11", "CAV/EC")
+        .when(substring(col("LIGNE_CREDIT"), 1, 2) == "12", "CAV/EF")
+        .when(substring(col("LIGNE_CREDIT"), 1, 2) == "21", "CAV")
+        .when(substring(col("LIGNE_CREDIT"), 1, 2) == "22", "TRESO")
+        .when(substring(col("LIGNE_CREDIT"), 1, 2) == "23", "EQUIPI")
+        .when(substring(col("LIGNE_CREDIT"), 1, 2) == "24", "CONS")
+        .when(substring(col("LIGNE_CREDIT"), 1, 2) == "25", "IMMO")
+        .when(substring(col("LIGNE_CREDIT"), 1, 2) == "27", "DEPOTS DIV")
+        .when(substring(col("LIGNE_CREDIT"), 1, 2) == "28", "CRE.DIV")
+        .when(substring(col("LIGNE_CREDIT"), 1, 2) == "29", "CRE.SOUF")
+        .when(substring(col("LIGNE_CREDIT"), 1, 2) == "31", "TITRES")
+        .when(substring(col("LIGNE_CREDIT"), 1, 2) == "91", "HB.ENG/EC")
+        .when(substring(col("LIGNE_CREDIT"), 1, 2) == "92", "HB.ENG/CLI")
+        .when(substring(col("LIGNE_CREDIT"), 1, 2) == "95", "HB.AVAL/EC")
+        .when(substring(col("LIGNE_CREDIT"), 1, 2) == "96", "HB.CAUT.AVAL")
+        .otherwise("AUTRES")
+        .alias("Type_RESS_EMPO"),
     )
 
-    return df
-
-
-def time_diff(df: DataFrame) -> DataFrame:
-    return df.withColumn(
-        "time_diff",
-        col("audit_fact_date")
-        - lag(col("audit_fact_date"), 1).over(
-            Window.partitionBy("user_id").orderBy("audit_fact_date")
-        ),
-    ).fillna(-1, ["time_diff"])
-
-
-def time_diff_inv(df: DataFrame) -> DataFrame:
-    return df.withColumn(
-        "time_diff_inv",
-        when(col("time_diff") == lit(0), exp(lit(1)))
-        .when(col("time_diff").isNull(), lit(1))
-        .otherwise(exp(1 / col("time_diff"))),
+    # Second part of the UNION - Working with LIGNE_Debit
+    part2 = capjour_param2_oe.filter(col("LIGNE_Debit").isNotNull()).select(
+        col("PCI"),
+        col("NATURE"),
+        col("LIGNE_Debit").alias("CODE_LIGNE"),
+        lit("EMP").alias("CATEGORIE"),
+        when(substring(col("LIGNE_Debit"), 1, 2) == "50", "R.BAM/TRES/CCP")
+        .when(substring(col("LIGNE_Debit"), 1, 2) == "51", "DET/EC")
+        .when(substring(col("LIGNE_Debit"), 1, 2) == "52", "DET/SF")
+        .when(substring(col("LIGNE_Debit"), 1, 2) == "61", "RAV")
+        .when(substring(col("LIGNE_Debit"), 1, 3).isin(["624", "627"]), "REP")
+        .when(substring(col("LIGNE_Debit"), 1, 3).isin(["625", "626"]), "RAT")
+        .when(substring(col("LIGNE_Debit"), 1, 2) == "65", "DEP.DIV")
+        .when(substring(col("LIGNE_Debit"), 1, 2).isin(["67", "68"]), "DEP.DIV")
+        .when(substring(col("LIGNE_Debit"), 1, 2) == "73", "CD")
+        .when(substring(col("LIGNE_Debit"), 1, 2) == "10", "E.BAM/TRES/CCP")
+        .when(substring(col("LIGNE_Debit"), 1, 2) == "11", "CAV/EC")
+        .when(substring(col("LIGNE_Debit"), 1, 2) == "12", "CAV/EF")
+        .when(substring(col("LIGNE_Debit"), 1, 2) == "21", "CAV")
+        .when(substring(col("LIGNE_Debit"), 1, 2) == "22", "TRESO")
+        .when(substring(col("LIGNE_Debit"), 1, 2) == "23", "EQUIPI")
+        .when(substring(col("LIGNE_Debit"), 1, 2) == "24", "CONS")
+        .when(substring(col("LIGNE_Debit"), 1, 2) == "25", "IMMO")
+        .when(substring(col("LIGNE_Debit"), 1, 2) == "27", "DEPOTS DIV")
+        .when(substring(col("LIGNE_Debit"), 1, 2) == "28", "CRE.DIV")
+        .when(substring(col("LIGNE_Debit"), 1, 2) == "29", "CRE.SOUF")
+        .when(substring(col("LIGNE_Debit"), 1, 2) == "31", "TITRES")
+        .when(substring(col("LIGNE_Debit"), 1, 2) == "91", "HB.ENG/EC")
+        .when(substring(col("LIGNE_Debit"), 1, 2) == "92", "HB.ENG/CLI")
+        .when(substring(col("LIGNE_Debit"), 1, 2) == "95", "HB.AVAL/EC")
+        .when(substring(col("LIGNE_Debit"), 1, 2) == "96", "HB.CAUT.AVAL")
+        .otherwise("AUTRES")
+        .alias("Type_RESS_EMPO"),
     )
 
-
-def time_diff_to_reset(df: DataFrame) -> DataFrame:
-    return df.withColumn(
-        "time_diff_to_reset",
-        when(
-            (
-                (col("is_reset_pattern_virement") == lit(1))
-                | (col("is_reset_pattern_disposition") == lit(1))
-            )
-            & col("event_type").isin(MONEY_OPERATIONS),
-            col("audit_fact_date")
-            - last(
-                when(
-                    col("event_type") == lit("9"),
-                    col("audit_fact_date"),
-                ),
-                ignorenulls=True,
-            ).over(
-                Window.partitionBy("user_id")
-                .orderBy("audit_fact_date")
-                .rowsBetween(Window.unboundedPreceding, Window.currentRow),
-            ),
-        ).otherwise(lit(-1)),
-    )
+    # Union the two parts
+    union_df = part1.union(part2)
+    return union_df.distinct()
 
 
-def time_diff_to_reset_normalized(df: DataFrame) -> DataFrame:
-    return df.withColumn(
-        "time_diff_to_reset_normalized",
-        when(col("time_diff_to_reset") == lit(-1), 10_000_000).otherwise(
-            col("time_diff_to_reset")
-        ),
-    ).withColumn(
-        "time_diff_to_reset_normalized",
-        lit(1) / (1 + col("time_diff_to_reset_normalized")),
-    )
-
-
-def time_diff_to_reset_exp(df: DataFrame) -> DataFrame:
-    return df.withColumn(
-        "time_diff_to_reset_exp",
-        when(col("time_diff_to_reset") == lit(-1), 1).otherwise(
-            col("time_diff_to_reset")
-        ),
-    ).withColumn(
-        "time_diff_to_reset_exp",
-        exp(lit(1) / col("time_diff_to_reset_exp")),
-    )
-
-
-def time_diff_to_reset_inv(df: DataFrame) -> DataFrame:
-    return df.withColumn(
-        "time_diff_to_reset_inv",
-        when(col("time_diff_to_reset") == lit(-1), 1).otherwise(
-            col("time_diff_to_reset")
-        ),
-    ).withColumn(
-        "time_diff_to_reset_inv",
-        lit(1) / col("time_diff_to_reset_inv"),
-    )
-
-
-def time_diff_to_reset_caped(df: DataFrame) -> DataFrame:
-    return df.withColumn(
-        "time_diff_to_reset_caped",
-        when(col("time_diff_to_reset") <= 86400, col("time_diff_to_reset")).otherwise(
-            0
-        ),
-    )
-
-
-def time_diff_to_reset_sigmoid(df: DataFrame) -> DataFrame:
-    def sigmoid(x: Column):
-        return 1 / (1 + exp(-x))
-
-    return df.withColumn(
-        "time_diff_to_reset_sigmoid", sigmoid(col("time_diff_to_reset"))
-    )
-
-
-def time_diff_to_reset_normalized_sigmoid(df: DataFrame) -> DataFrame:
-    def normalized_sigmoid(x: Column):
-        return 1 / (1 + exp(-x / 86_400))
-
-    return df.withColumn(
-        "time_diff_to_reset_normalized_sigmoid",
-        when(col("time_diff_to_reset") == lit(-1), 10_000_000).otherwise(
-            col("time_diff_to_reset")
-        ),
-    ).withColumn(
-        "time_diff_to_reset_normalized_sigmoid",
-        normalized_sigmoid(col("time_diff_to_reset_normalized_sigmoid")),
-    )
-
-
-def criterion(df: DataFrame) -> DataFrame:
-    return df.withColumn(
-        "criterion",
-        (col("is_reset_pattern_disposition") + col("is_reset_pattern_virement"))
-        * col("time_diff_to_reset_normalized"),
-    )
-
-
-def accounts_count(df: DataFrame) -> DataFrame:
-    only_ips = df.filter(is_ip())
-    ips_with_count = (
-        only_ips.withColumn(
-            "lag_user_id",
-            lag("user_id").over(
-                Window.partitionBy("user_ip_address").orderBy("audit_fact_date")
-            ),
-        )
-        .withColumn(
-            "change",
-            sum(
-                when(
-                    col("user_id") != col("lag_user_id"),
-                    lit(1),
-                ).otherwise(lit(0)),
-            ).over(Window.partitionBy("user_ip_address").orderBy("audit_fact_date")),
-        )
-        .withColumn(
-            "accounts_count",
-            when(
-                col("event_type").isin(MONEY_OPERATIONS),
-                col("change") + 1,
-            ),
-        )
-        .select("id", "accounts_count")
-    )
-    return df.join(ips_with_count, ["id"], "left_outer")
-
-
-def time_diff_to_last_money_operation_by_ip(df: DataFrame) -> DataFrame:
-    only_ips = df.filter(is_ip()).filter(col("event_type").isin(MONEY_OPERATIONS))
-
-    ips_with_time_diff = only_ips.withColumn(
-        "time_diff_to_last_money_operation_by_ip",
-        col("audit_fact_date")
-        - lag(col("audit_fact_date"), count=1).over(
-            Window.partitionBy("user_ip_address").orderBy("audit_fact_date")
-        ),
-    ).select("id", "time_diff_to_last_money_operation_by_ip")
-
-    return df.join(ips_with_time_diff, ["id"], "left_outer")
-
-
-def device_change(df: DataFrame) -> DataFrame:
-    w = Window.partitionBy("user_id").orderBy("audit_fact_date")
-
+def build_emplois_daily_hist(
+    capjour_param2_oe: DataFrame,
+    type_ress_emp: DataFrame,
+    mapping_type_emploi: DataFrame,
+) -> DataFrame:
     return (
-        df.withColumn("phone", split(col("os"), "/")[1])
-        .withColumn(
-            "device_change",
-            (col("uuid").isNotNull() & lag(col("uuid")).over(w).isNull())
-            | (col("uuid") != lag(col("uuid")).over(w))
-            & (col("phone") != lag(col("phone")).over(w))
-            & (col("name") != lag(col("name")).over(w)),
+        capjour_param2_oe.alias("a")
+        .join(
+            mapping_type_emploi.alias("c"),
+            expr("a.PCI = c.PCI AND a.NATURE_EXTERNE = c.NATURE_EXTERNE"),
+            "left_outer",
         )
-        .withColumn("device_change", when(col("device_change"), 1).otherwise(0))
+        .join(
+            type_ress_emp.alias("e"),
+            expr(
+                "a.PCI = concat(e.PCI, '0')"
+                "AND a.NATURE_EXTERNE = e.NATURE AND e.categorie = 'EMP'"
+            ),
+            "left_outer",
+        )
+        .select(
+            col("a.DTTRTM"),
+            col("a.PCI"),
+            col("a.NATURE_EXTERNE").alias("NATURE"),
+            col("a.numerodecompte"),
+            col("a.devise"),
+            col("a.soldejourcr"),
+            col("a.soldejourdb"),
+            col("a.soldejourcr_devise"),
+            col("a.soldejourdb_devise"),
+            col("c.TYPE_EMPLOI").alias("NOUVEAU_TYPE_EMPLOI"),
+            col("e.Type_RESS_EMPO").alias("ANCIEN_TYPE_EMPLOI"),
+        )
+        .filter(capjour_param2_oe["soldejourdb"].isNotNull())
     )
 
 
-def device_count(df: DataFrame) -> DataFrame:
-    return df.withColumn(
-        "device_count",
-        sum(col("device_change")).over(
-            Window.partitionBy("user_id").orderBy("audit_fact_date")
-        ),
-    )
-
-
-def is_pattern(pattern: str):
-    return regexp_extract(
-        "pattern",
-        pattern,
-        0,
-    ) != lit("")
-
-
-def is_attijari_secure_deactivated_pattern(df: DataFrame) -> DataFrame:
+def build_ress_daily_hist(
+    sldcli_nature_daily_devises: DataFrame,
+    mapping_type_ressource: DataFrame,
+    type_ress_emp: DataFrame,
+) -> DataFrame:
     return (
-        rank(df, "rank", "7")
-        .withColumn(
-            "pattern",
-            when(
-                col("event_type").isin(MONEY_OPERATIONS)
-                & (col("device_count") > 0),  # TODO: add event for cashexpres B
-                collect_list(col("event_type")).over(
-                    Window.partitionBy("user_id", "rank")
-                    .orderBy("audit_fact_date")
-                    .rowsBetween(Window.unboundedPreceding, Window.currentRow)
-                ),
+        sldcli_nature_daily_devises.alias("a")
+        .join(
+            mapping_type_ressource.alias("c"),
+            expr("a.PCI = concat(c.PCI, '0') AND a.NATURE_EXTERNE = c.NATURE"),
+            "left_outer",
+        )
+        .join(
+            type_ress_emp.alias("e"),
+            expr(
+                "a.PCI = concat(e.PCI, '0')"
+                "AND a.NATURE_EXTERNE = e.NATURE and e.CATEGORIE='RESS'"
             ),
+            "left_outer",
         )
-        .withColumn("pattern", array_join(col("pattern"), ","))
-        .withColumn(
-            "is_attijari_secure_deactivated_pattern",
-            when(
-                (is_pattern(r"^7,.*6,.*1,") & col("event_type").isin("2"))
-                | (is_pattern(r"^7,.*6,") & col("event_type").isin("5"))
-                | (is_pattern(r"^7,.*6,.*C,") & col("event_type").isin("B")),
-                # TODO: add pattern for cashexpres B
-                1,
-            ).otherwise(0),
+        .select(
+            col("a.DTTRTM"),
+            col("a.PCI"),
+            col("a.NATURE_EXTERNE").alias("NATURE"),
+            col("a.numerodecompte"),
+            col("a.devise"),
+            col("a.soldejourcr"),
+            col("a.soldejourdb"),
+            col("a.soldejourcr_devise"),
+            col("a.soldejourdb_devise"),
+            col("c.TYPE_RESSOURCE").alias("NOUVEAU_TYPE"),
+            col("e.Type_RESS_EMPO").alias("ANCIEN_TYPE"),
         )
-        .drop("pattern", "rank")
+        .filter(sldcli_nature_daily_devises["soldejourcr"].isNotNull())
     )
 
 
-def is_attijari_secure_activated_pattern(df: DataFrame) -> DataFrame:
-    return (
-        rank(df, "rank", "6")
-        .withColumn(
-            "pattern",
-            when(
-                col("event_type").isin(MONEY_OPERATIONS)
-                & (col("device_count") > 0),  # TODO: Add event B
-                collect_list(col("event_type")).over(
-                    Window.partitionBy("user_id", "rank")
-                    .orderBy("audit_fact_date")
-                    .rowsBetween(Window.unboundedPreceding, Window.currentRow)
-                ),
-            ),
-        )
-        .withColumn("pattern", array_join(col("pattern"), ","))
-        .withColumn(
-            "is_attijari_secure_activated_pattern",
-            when(
-                (is_pattern(r"^6,.*1,") & col("event_type").isin("2"))
-                | (is_pattern(r"^6,") & col("event_type").isin("5"))
-                | (is_pattern(r"^6,.*C,") & col("event_type").isin("B")),
-                # TODO: Add pattern for cashexpres B
-                1,
-            ).otherwise(0),
-        )
-        .drop("pattern", "rank")
+def build_sldcli_nature_daily_devises(
+    spark: SparkSession,
+    dm_sldcli: DataFrame,
+    rp_gl_bct: DataFrame,
+    reference_nature_compte_pci: DataFrame,
+    taux_change_bam_hist: DataFrame,
+    exploit_ref_devise: DataFrame,
+) -> DataFrame:
+    dm_sldcli.createOrReplaceTempView("dm_sldcli")
+    rp_gl_bct.createOrReplaceTempView("rp_gl_bct")
+    reference_nature_compte_pci.createOrReplaceTempView("reference_nature_compte_pci")
+    taux_change_bam_hist.createOrReplaceTempView("taux_change_bam_hist")
+    exploit_ref_devise.createOrReplaceTempView("exploit_ref_devise")
+
+    return spark.sql(
+        """
+WITH devises AS
+(SELECT a.CODE_DEVISE,
+        b.CD_DEV_OPER,
+        a.TAUXDECHANGE,
+        a.TYPE,
+        a.DATE
+FROM TAUX_CHANGE_BAM_HIST a
+JOIN EXPLOIT_REF_DEVISE b ON a.CODE_DEVISE=b.CD_DEVISE)
+SELECT DISTINCT
+tmp1.DTTRTM,
+tmp1.PCI,
+tmp1.NATURE_EXTERNE,
+tmp1.NUMERODECOMPTE ,
+tmp1.DEVISE,
+tmp2.TYPE,
+CAST(tmp1.SOLDEJOURCR AS DECIMAL(38, 4)) AS SOLDEJOURCR,
+CAST(tmp1.SOLDEJOURCR AS DECIMAL(38, 4)) * CAST(tmp2.TAUXDECHANGE AS DECIMAL(38, 4)) AS SOLDEJOURCR_devise,
+CAST(tmp1.SOLDEJOURDB AS DECIMAL(38, 4)) AS SOLDEJOURDB,
+CAST(tmp1.SOLDEJOURDB AS DECIMAL(38, 4)) * CAST(tmp2.TAUXDECHANGE AS DECIMAL(38, 4)) AS SOLDEJOURDB_devise
+FROM
+(SELECT c.DTTRTM,
+        f.PCI,
+        (CASE
+            WHEN d.nature_externe IS NULL THEN SUBSTRING(c.NUMERODECOMPTE, 4, 3)
+            ELSE d.nature_externe
+        END) AS NATURE_EXTERNE,
+        c.NUMERODECOMPTE,
+        c.DEVISE,
+        c.SOLDEJOURCR,
+        c.SOLDEJOURDB,
+        (CASE
+            WHEN f.PCI IN ('111300',
+                            '111400',
+                            '112110',
+                            '112120',
+                            '461100',
+                            '462100',
+                            '466130') THEN 'BILLET'
+            ELSE 'VIREMENT'
+        END) AS TYPE
+FROM DM_SLDCLI c
+LEFT JOIN RP_GL_BCT d ON c.NUMERODECOMPTE=d.COMPTE_CLIENT
+LEFT JOIN REFERENCE_NATURE_COMPTE_PCI f ON c.NTCPTE=f.Nature) tmp1
+LEFT JOIN devises tmp2 ON tmp1.DEVISE=tmp2.CD_DEV_OPER
+AND tmp1.TYPE=tmp2.TYPE
+AND CAST(tmp1.DTTRTM AS DATE)=CAST(tmp2.DATE AS DATE);
+    """
     )
 
 
-def time_diff_to_attijari_secure(df: DataFrame) -> DataFrame:
-    return df.withColumn(
-        "time_diff_to_attijari_secure",
-        when(
-            (
-                (col("is_attijari_secure_activated_pattern") == lit(1))
-                | (col("is_attijari_secure_deactivated_pattern") == lit(1))
-            )
-            & col("event_type").isin(MONEY_OPERATIONS),
-            col("audit_fact_date")
-            - last(
-                when(
-                    col("event_type") == lit("6"),
-                    col("audit_fact_date"),
-                ),
-                ignorenulls=True,
-            ).over(
-                Window.partitionBy("user_id")
-                .orderBy("audit_fact_date")
-                .rowsBetween(Window.unboundedPreceding, Window.currentRow),
-            ),
-        ).otherwise(lit(-1)),
+def build_taux_change_bam_hist(
+    spark: SparkSession,
+    taux_change_billet_hist: DataFrame,
+    taux_change_virement_hist: DataFrame,
+) -> DataFrame:
+    df_virement = taux_change_virement_hist.withColumn("TYPE", lit("VIREMENT"))
+    df_billet = taux_change_billet_hist.withColumn("TYPE", lit("BILLET"))
+
+    df_billet.createOrReplaceTempView("BILLET")
+    df_virement.createOrReplaceTempView("VIREMENT")
+
+    return spark.sql(
+        """
+        SELECT * FROM BILLET
+        UNION
+        SELECT * FROM VIREMENT ;
+    """
     )
-
-
-def time_diff_to_attijari_secure_normalized(df: DataFrame) -> DataFrame:
-    return df.withColumn(
-        "time_diff_to_attijari_secure_normalized",
-        when(
-            (col("time_diff_to_attijari_secure") == lit(-1)), lit(10_000_000)
-        ).otherwise(col("time_diff_to_attijari_secure")),
-    ).withColumn(
-        "time_diff_to_attijari_secure_normalized",
-        lit(1) / (1 + col("time_diff_to_attijari_secure_normalized")),
-    )
-
-
-def device_age(df: DataFrame, relative_to: Column) -> DataFrame:
-    return df.withColumn(
-        "device_age",
-        when(
-            col("event_type").isin(MONEY_OPERATIONS),
-            relative_to - col("creation_date"),
-        ).otherwise(-1),
-    )
-
-
-def device_age_normalized(df: DataFrame) -> DataFrame:
-    return df.withColumn(
-        "device_age_normalized",
-        when(
-            (col("device_age") == lit(-1)),
-            lit(10_000_000),
-        ).otherwise(col("device_age")),
-    ).withColumn(
-        "device_age_normalized",
-        lit(1) / (1 + col("device_age_normalized")),
-    )
-
-
-def amount_virement(df: DataFrame) -> DataFrame:
-    return df.withColumn(
-        "amount_virement",
-        when(
-            col("event_type") == lit("2"),
-            regexp_extract(col("audit_message"), r"Montant \[(.*?)\]", 1),
-        ),
-    ).withColumn(
-        "amount_virement", coalesce(col("amount_virement").cast("double"), lit(0.0))
-    )
-
-
-def amount_cashexpress(df: DataFrame) -> DataFrame:
-    return df.withColumn(
-        "amount_cashexpress",
-        when(
-            col("event_type") == lit("B"),
-            regexp_extract(col("audit_message"), r"Montant \[(.*?)\]", 1),
-        ),
-    ).withColumn(
-        "amount_cashexpress",
-        coalesce(col("amount_cashexpress").cast("double"), lit(0.0)),
-    )
-
-
-def amount_disposition(df: DataFrame) -> DataFrame:
-    return df.withColumn(
-        "amount_disposition",
-        when(
-            col("event_type") == lit("5"),
-            regexp_extract(col("audit_message"), r"montant=(.*?),", 1),
-        ),
-    ).withColumn(
-        "amount_disposition",
-        coalesce(col("amount_disposition").cast("double"), lit(0.0)),
-    )
-
-
-def device_count_last_7_days(df: DataFrame) -> DataFrame:
-    w = (
-        Window.partitionBy("user_id")
-        .orderBy("audit_fact_date")
-        .rangeBetween(
-            -7 * 24 * 60 * 60, 0
-        )  # 24 * 60 * 60 = 86400 = number of seconds in a day
-    )
-
-    return df.withColumn(
-        "device_count_last_7_days",
-        when(
-            col("event_type").isin(MONEY_OPERATIONS),
-            sum(col("device_change")).over(w),
-        ).otherwise(0),
-    )
-
-
-def device_count_last_14_days(df: DataFrame) -> DataFrame:
-    w = (
-        Window.partitionBy("user_id")
-        .orderBy("audit_fact_date")
-        .rangeBetween(
-            -14 * 24 * 60 * 60, 0
-        )  # 24 * 60 * 60 = 86400 = number of seconds in a day
-    )
-
-    return df.withColumn(
-        "device_count_last_14_days",
-        when(
-            col("event_type").isin(MONEY_OPERATIONS),
-            sum(col("device_change")).over(w),
-        ).otherwise(0),
-    )
-
-
-def device_count_last_30_days(df: DataFrame) -> DataFrame:
-    w = (
-        Window.partitionBy("user_id")
-        .orderBy("audit_fact_date")
-        .rangeBetween(
-            -30 * 24 * 60 * 60, 0
-        )  # 24 * 60 * 60 = 86400 = number of seconds in a day
-    )
-
-    return df.withColumn(
-        "device_count_last_30_days",
-        when(
-            col("event_type").isin(MONEY_OPERATIONS),
-            sum(col("device_change")).over(w),
-        ).otherwise(0),
-    )
-
-
-def cumsum_disposition_12_hours(df: DataFrame) -> DataFrame:
-    w = (
-        Window.partitionBy("user_id")
-        .orderBy("audit_fact_date")
-        .rangeBetween(
-            -12 * 60 * 60, 0
-        )  # 60 * 60 = 3600 = number of seconds in a 12 hours
-    )
-
-    return df.withColumn(
-        "cumsum_disposition_12_hours",
-        when(
-            col("event_type") == lit("5"),
-            sum(col("amount_disposition")).over(w),
-        ).otherwise(0),
-    )
-
-
-def cumsum_virement_12_hours(df: DataFrame) -> DataFrame:
-    w = (
-        Window.partitionBy("user_id")
-        .orderBy("audit_fact_date")
-        .rangeBetween(
-            -12 * 60 * 60, 0
-        )  # 60 * 60 = 3600 = number of seconds in a 12 hours
-    )
-
-    return df.withColumn(
-        "cumsum_virement_12_hours",
-        when(
-            col("event_type") == lit("2"),
-            sum(col("amount_virement")).over(w),
-        ).otherwise(0),
-    )
-
-
-def cumsum_cashexpress_12_hours(df: DataFrame) -> DataFrame:
-    w = (
-        Window.partitionBy("user_id")
-        .orderBy("audit_fact_date")
-        .rangeBetween(
-            -12 * 60 * 60, 0
-        )  # 60 * 60 = 3600 = number of seconds in a 12 hours
-    )
-
-    return df.withColumn(
-        "cumsum_cashexpress_12_hours",
-        when(
-            col("event_type") == lit("B"),
-            sum(col("amount_cashexpress")).over(w),
-        ).otherwise(0),
-    )
-
-
-def ratio_amount_cumsum_virement(df: DataFrame) -> DataFrame:
-    return df.withColumn(
-        "ratio_amount_cumsum_virement",
-        when(
-            col("event_type") == lit("2"),
-            col("amount_virement") / col("cumsum_virement_12_hours"),
-        ).otherwise(0),
-    )
-
-
-def count_device_per_uuid(df: DataFrame) -> DataFrame:
-    w = (
-        Window.partitionBy("uuid")
-        .orderBy("audit_fact_date")
-        .rangeBetween(
-            -3 * 24 * 60 * 60, 0
-        )  # 24 * 60 * 60 = 86400 = number of seconds in a day
-    )
-
-    return df.withColumn(
-        "count_device_per_uuid",
-        when(
-            col("event_type").isin(MONEY_OPERATIONS),
-            approx_count_distinct(col("user_id"), rsd=0.1).over(w),
-        ).otherwise(0),
-    )
-
-
-def time_diff_to_last_significant_transaction(df: DataFrame) -> DataFrame:
-    w = (
-        Window.partitionBy("user_id")
-        .orderBy("audit_fact_date")
-        .rowsBetween(Window.unboundedPreceding, -1)
-    )
-    return df.withColumn(
-        "time_diff_to_last_significant_transaction",
-        when(
-            col("event_type") == lit("2"),
-            col("audit_fact_date")
-            - last(
-                when(
-                    (col("event_type") == lit("2"))
-                    & (col("amount_virement") >= SIGNIFICANT_VIREMENT),
-                    col("audit_fact_date"),
-                ),
-                ignorenulls=True,
-            ).over(w),
-        )
-        .when(
-            col("event_type") == lit("5"),
-            col("audit_fact_date")
-            - last(
-                when(
-                    (col("event_type") == lit("5"))
-                    & (col("amount_disposition") >= SIGNIFICANT_DISPOSITION),
-                    col("audit_fact_date"),
-                ),
-                ignorenulls=True,
-            ).over(w),
-        )
-        .otherwise(lit(-1)),
-    ).fillna(-1, ["time_diff_to_last_significant_transaction"])
-
-
-def time_diff_to_last_maxed_transaction(df: DataFrame) -> DataFrame:
-    w = (
-        Window.partitionBy("user_id")
-        .orderBy("audit_fact_date")
-        .rowsBetween(Window.unboundedPreceding, -1)
-    )
-
-    return df.withColumn(
-        "time_diff_to_last_maxed_transaction",
-        when(
-            col("event_type") == lit("2"),
-            col("audit_fact_date")
-            - last(
-                when(
-                    (col("event_type") == lit("2"))
-                    & (col("amount_virement") == MAX_VIREMENT),
-                    col("audit_fact_date"),
-                ),
-                ignorenulls=True,
-            ).over(w),
-        )
-        .when(
-            col("event_type") == lit("5"),
-            col("audit_fact_date")
-            - last(
-                when(
-                    (col("event_type") == lit("5"))
-                    & (col("amount_disposition") == MAX_DISPOSITION),
-                    col("audit_fact_date"),
-                ),
-                ignorenulls=True,
-            ).over(w),
-        )
-        .otherwise(lit(-1)),
-    ).fillna(-1, ["time_diff_to_last_maxed_transaction"])
-
-
-def is_facture_reset_pattern_shutdown(df: DataFrame) -> DataFrame:
-    condition_virement = (
-        regexp_extract(
-            "pattern",
-            r"^9,(.+,)*(((.+,)*3,(.+,)*(A,)+)|((A,)+(.+,)*3,(.+,)*))(.+,)*1,",
-            0,
-        )
-        != lit("")
-    ) & (col("event_type") == lit(2))
-
-    condition_disposition = (
-        regexp_extract(
-            "pattern",
-            r"^9,(.+,)*(((.+,)*3,(.+,)*(A,)+)|((A,)+(.+,)*3,(.+,)*))(.+,)*",
-            0,
-        )
-        != lit("")
-    ) & (col("event_type") == lit(5))
-
-    conditions = condition_disposition | condition_virement
-
-    df = (
-        df.withColumn(
-            "pattern",
-            when(
-                col("event_type").isin("2", "5"),  # TODO: add event cashexpress B
-                collect_list(col("event_type")).over(
-                    Window.partitionBy("user_id", "rank")
-                    .orderBy("audit_fact_date")
-                    .rowsBetween(Window.unboundedPreceding, Window.currentRow)
-                ),
-            ),
-        )
-        .withColumn("pattern", array_join(col("pattern"), ","))
-        .withColumn(
-            "is_facture_reset_pattern_shutdown", when(conditions, 1).otherwise(0)
-        )
-        .drop("pattern")
-    )
-
-    return df
-
-
-def is_safe_facture_device(df: DataFrame) -> DataFrame:
-    return (
-        df.withColumn(
-            "bill_device", when(col("event_type") == lit("A"), col("mobile_device_id"))
-        )
-        .withColumn(
-            "old_devices",
-            when(
-                col("event_type").isin(MONEY_OPERATIONS),
-                collect_set(col("bill_device")).over(
-                    Window.partitionBy("user_id")
-                    .orderBy("audit_fact_date")
-                    .rowsBetween(-30 * 24 * 60 * 60, -1)  # Last 30 days
-                ),
-            ),
-        )
-        .withColumn(
-            "is_safe_facture_device",
-            expr("array_contains(old_devices, mobile_device_id)"),
-        )
-        .withColumn(
-            "is_safe_facture_device",
-            when(col("is_safe_facture_device") == lit(True), 1).otherwise(0),
-        )
-        .drop("bill_device", "old_devices")
-    )
-
-
-def is_new_beneficiary(df: DataFrame) -> DataFrame:
-    w = (
-        Window.partitionBy("user_id")
-        .orderBy("audit_fact_date")
-        .rangeBetween(-3 * 24 * 60 * 60, 0)  # Last 3 days
-    )
-
-    return (
-        df.withColumn(
-            "beneficiary",
-            when(
-                col("event_type") == lit("1"),
-                trim(extract_field_from_message("RIB ajouté:")),
-            ),
-        )
-        # RIB: 3 digits code banque - 3 digits code ville - 16 digits num compte - 2 digits cle rib
-        .withColumn(
-            "beneficiary", substring(col("beneficiary"), 7, 23)
-        )  # 7+16 numero compte
-        .withColumn(
-            "new_beneficiary_list",
-            when(
-                col("event_type")
-                == lit("2"),  # TODO: maybe do the same to event cashexpress B
-                collect_set(col("beneficiary")).over(w),
-            ),
-        )
-        .withColumn(
-            "current_beneficiary",
-            trim(extract_field_with_brackets_from_message("Compte bénéficiaire")),
-        )
-        .withColumn(
-            "is_new_beneficiary",
-            expr("array_contains(new_beneficiary_list, current_beneficiary)"),
-        )
-        .withColumn(
-            "is_new_beneficiary",
-            when(col("is_new_beneficiary") == lit(True), 1).otherwise(0),
-        )
-        .drop("beneficiary", "new_beneficiary_list", "current_beneficiary")
-    )
-
-
-def is_low_virement(df: DataFrame) -> DataFrame:
-    return df.withColumn(
-        "is_low_virement",
-        when(
-            (col("event_type") == lit("2"))
-            & (col("amount_virement") < LOW_VIREMENT_THRESHOLD),
-            1,
-        ).otherwise(0),
-    )
-
-
-def average_amount_scaled_12h(df: DataFrame) -> DataFrame:
-    w = (
-        Window.partitionBy("user_id")
-        .orderBy("audit_fact_date")
-        .rangeBetween(-12 * 60 * 60, 0)  # Last 12 hours
-    )
-    return (
-        df.withColumn(
-            "count_events_12h",
-            sum(when(col("event_type").isin(MONEY_OPERATIONS), 1)).over(w),
-        )
-        .withColumn(
-            "sum_amount_scaled_12h",
-            sum(
-                when(col("event_type").isin(MONEY_OPERATIONS), col("amount_scaled"))
-            ).over(w),
-        )
-        .withColumn(
-            "average_amount_scaled_12h",
-            when(
-                col("event_type").isin(MONEY_OPERATIONS),
-                col("sum_amount_scaled_12h") / col("count_events_12h"),
-            ).otherwise(0),
-        )
-    ).drop("count_events_12h", "sum_amount_scaled_12h")

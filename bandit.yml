@@ -1,7 +1,0 @@
-assert_used:
-  skips: ['*tests/**']
-
-try_except_pass:
-  check_typed_exception: True
-
-skips: ['B108'] # allow usage of /tmp dir

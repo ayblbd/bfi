@@ -1,38 +1,43 @@
 #!/bin/bash
 
 job=$1
+env=${2:-prod}
 
-if [[ "$(echo "$job" | tr '[:upper:]' '[:lower:]')" == *"train"* ]]; then
-  type="train.py"
-elif [[ "$(echo "$job" | tr '[:upper:]' '[:lower:]')" == *"infer"* ]]; then
-  type="inference.py"
-elif [[ "$(echo "$job" | tr '[:upper:]' '[:lower:]')" == *"feature"* ]]; then
-  type="features.py"
+if [[ "$(echo "$job" | tr '[:upper:]' '[:lower:]')" == *"main"* ]]; then
+  type="main.py"
+else
+  echo "Error: job does not contain 'main'" >&2
+  exit 1
 fi
 
-
+if [[ "$(echo "$env" | tr '[:upper:]' '[:lower:]')" == *"dev"* ]]; then
+  env="dev"
+elif [[ "$(echo "$env" | tr '[:upper:]' '[:lower:]')" == *"prod"* ]]; then
+  env="prod"
+else
+  echo "Error: env does not contain 'dev' or 'prod'" >&2
+  exit 1
+fi
 
 export PYTHONIOENCODING=utf8
 export HADOOP_USER_NAME=hdfs
 export HADOOP_CONF_DIR=/etc/hadoop/conf
-export YARN_CONF_DIR=/etc/hbase/conf
+export YARN_CONF_DIR=/etc/hadoop/conf
 export PYSPARK_PYTHON=./venv/bin/python
 
 log4j_setting="-Dlog4j.configuration=file:log4j.properties"
 
 zip -j src.zip src/*.py
 
-spark-submit --conf spark.yarn.appMasterEnv.PYSPARK_PYTHON=./venv/bin/python \
-             --master yarn \
-             --deploy-mode client \
-             --queue analytics \
-             --num-executors 6  \
-             --driver-memory 16g \
-             --executor-memory 16g \
-             --conf "spark.driver.extraJavaOptions=${log4j_setting}" \
-             --conf "spark.executor.extraJavaOptions=${log4j_setting}" \
-             --files log4j.properties \
-             --conf spark.yarn.dist.files=./hive-site.xml \
-             --py-files "h2o_pysparkling_2.4-3.36.1.2-1-2.4.zip" \
-             --py-files src.zip \
-             $type
+spark-submit \
+  --conf spark.yarn.appMasterEnv.PYSPARK_PYTHON=./venv/bin/python \
+  --master yarn \
+  --deploy-mode client \
+  --num-executors 2 \
+  --driver-memory 8g \
+  --executor-memory 4g \
+  --conf "spark.driver.extraJavaOptions=${log4j_setting}" \
+  --conf "spark.executor.extraJavaOptions=${log4j_setting}" \
+  --files log4j.properties \
+  --py-files src.zip \
+  $type $env

@@ -1,6 +1,6 @@
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v2.3.0
+    rev: v4.6.0
     hooks:
       - id: check-ast
       - id: check-merge-conflict
@@ -9,41 +9,26 @@ repos:
       - id: trailing-whitespace
       - id: check-added-large-files
   - repo: https://github.com/psf/black
-    rev: 22.3.0
+    rev: 24.4.2
     hooks:
       - id: black
-  - repo: https://github.com/myint/autoflake
-    rev: v1.4
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    # Ruff version.
+    rev: v0.4.4
     hooks:
-      - id: autoflake
-        args:
-          - --in-place
-          - --ignore-init-module-imports
-          - --remove-unused-variables
-          - --remove-all-unused-imports
-          - --expand-star-imports
-          - --recursive
-          - src
-  - repo: https://github.com/PyCQA/isort
-    rev: "5.10.1"
+      # Run the linter.
+      - id: ruff
+  - repo: https://github.com/facebook/usort
+    rev: v1.0.7
     hooks:
-      - id: isort
-  - repo: https://github.com/pycqa/flake8
-    rev: 4.0.1
-    hooks:
-      - id: flake8
+      - id: usort
   - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: "v0.942"
+    rev: "v1.10.0"
     hooks:
       - id: mypy
         args: [--strict-optional, --ignore-missing-imports]
   - repo: https://github.com/asottile/pyupgrade
-    rev: v2.31.0
+    rev: v3.15.2
     hooks:
       - id: pyupgrade
         args: [--py37]
-  - repo: https://github.com/pre-commit/pygrep-hooks
-    rev: v1.9.0
-    hooks:
-      - id: python-check-mock-methods
-      - id: python-use-type-annotations
