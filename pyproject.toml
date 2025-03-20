@@ -16,16 +16,17 @@ exclude = '''
 '''
 
 [tool.poe.tasks]
-ruff = "ruff src/ tests/ --fix"
-mypy = "mypy src/ tests/ --explicit-package-bases --namespace-packages"
-black = "black src/ tests/"
-usort = "usort format src/ tests/"
+ruff = "ruff check src/ tests/ --fix"
+format = "ruff format src/ tests/"
+mypy = "mypy src/ tests/ *.py --explicit-package-bases --namespace-packages --check-untyped-defs"
+black = "black src/ tests/ *.py"
 test = "pytest -v -s tests/"
 cov = "coverage run --source=src -m pytest -v -s tests/"
 report = "coverage report -m"
-requirements = "poetry export --without-hashes -f requirements.txt --output requirements.txt && poetry export --with dev --without-hashes -f requirements.txt --output requirements-dev.txt"
+requirements = "poetry export --without-hashes -f requirements.txt --output requirements.txt"
+requirements-dev = "poetry export --with dev --without-hashes -f requirements.txt --output requirements-dev.txt"
 covtest = ["cov", "report"]
-all = ["black", "usort", "mypy", "ruff"]
+all = ["ruff", "format", "mypy"]
 
 [tool.coverage.run]
 omit = ["*/tests/*", "*/__init__.py"]
@@ -34,18 +35,20 @@ omit = ["*/tests/*", "*/__init__.py"]
 fail_under = 80
 
 [tool.poetry]
-name = "cdm-bfi"
+name = "cdm-datalake"
 version = "0.1.0"
 description = ""
-authors = ["Ayoub LABYAD <ayoublabiad@gmail.com>"]
+authors = ["Ayoub Labiad <ayoub.labiadexterne@cdm.ma>"]
+package-mode = false
 
 [tool.poetry.dependencies]
 python = "^3.8"
 
-[tool.poetry.dev-dependencies]
+[tool.poetry.group.dev.dependencies]
+poethepoet = "^0.26.1"
+ruff = "^0.6.9"
 black = "^22.3.0"
 mypy = "^0.942"
-usort = "^1.0.7"
 pre-commit = "^2.18.1"
 pyspark = "3.3.4"
 pytest = "^7.1.1"
@@ -55,8 +58,6 @@ notebook = "^6.4.12"
 pytest-cov = "^3.0.0"
 coverage = { extras = ["toml"], version = "^6.4.4" }
 pytest-mock = "^3.8.2"
-poethepoet = "^0.22.0"
-ruff = "^0.0.291"
 pandas-stubs = "2.0.3.230814"
 
 [build-system]
@@ -64,11 +65,17 @@ requires = ["poetry-core>=1.0.0"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.ruff]
-ignore = ["E402"]
-fixable = ["ALL"]
+lint.ignore = ["E402"]
+lint.fixable = ["ALL"]
 target-version = "py38"
-line-length = 120
+line-length = 85
+lint.extend-select = ["I"]
 
 [[tool.mypy.overrides]]
 module = ["findspark"]
 ignore_missing_imports = true
+
+[[tool.poetry.source]]
+name = "nexus"
+url = "https://nexus-infra.cdm.co.ma/repository/pypi/simple"
+priority = "primary"

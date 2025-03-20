@@ -1,0 +1,16 @@
+pages:
+  stage: deploy
+  script:
+    - echo 'execute git fetch to /home/user/spark'
+    - cp -r /home/gitlab-runner/builds/MNqsyd9y/0/lakehouse/scripts-pyspark/* /home/user/spark
+    #- chmod -R u+x /home/user/spark/*.sh
+    - echo 'transfer done'
+  after_script:
+    - echo "there is nothing to cleanup for now "
+    - rm -rf /home/user/spark/.git
+    - rm /home/user/spark/readme.md
+  only:
+    - dev
+  tags:
+    - rct
+    - spark
